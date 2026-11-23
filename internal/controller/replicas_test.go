@@ -25,6 +25,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -300,5 +301,224 @@ var _ = Describe("Check pods not on primary node", func() {
 
 	It("first status element is primary", func() {
 		Expect(GetPodsNotOnPrimaryNode(statusList2, &statusList2.Items[0]).Items).ToNot(BeEmpty())
+	})
+})
+
+var _ = Describe("requiredHealthyStandbysAfterSwitchover", func() {
+	newCluster := func(instances int, sync *apiv1.SynchronousReplicaConfiguration, minSync int) *apiv1.Cluster {
+		return &apiv1.Cluster{
+			Spec: apiv1.ClusterSpec{
+				Instances:       instances,
+				MinSyncReplicas: minSync,
+				PostgresConfiguration: apiv1.PostgresConfiguration{
+					Synchronous: sync,
+				},
+			},
+		}
+	}
+
+	It("requires nothing when synchronous replication is not configured", func() {
+		Expect(requiredHealthyStandbysAfterSwitchover(newCluster(3, nil, 0))).To(Equal(0))
+	})
+
+	It("requires the configured number of synchronous standbys with dataDurability required", func() {
+		cluster := newCluster(4, &apiv1.SynchronousReplicaConfiguration{
+			Method:         apiv1.SynchronousReplicaConfigurationMethodAny,
+			Number:         2,
+			DataDurability: apiv1.DataDurabilityLevelRequired,
+		}, 0)
+		Expect(requiredHealthyStandbysAfterSwitchover(cluster)).To(Equal(2))
+	})
+
+	It("treats an empty dataDurability as required", func() {
+		cluster := newCluster(3, &apiv1.SynchronousReplicaConfiguration{
+			Method: apiv1.SynchronousReplicaConfigurationMethodAny,
+			Number: 1,
+		}, 0)
+		Expect(requiredHealthyStandbysAfterSwitchover(cluster)).To(Equal(1))
+	})
+
+	It("requires nothing with dataDurability preferred", func() {
+		cluster := newCluster(3, &apiv1.SynchronousReplicaConfiguration{
+			Method:         apiv1.SynchronousReplicaConfigurationMethodAny,
+			Number:         1,
+			DataDurability: apiv1.DataDurabilityLevelPreferred,
+		}, 0)
+		Expect(requiredHealthyStandbysAfterSwitchover(cluster)).To(Equal(0))
+	})
+
+	It("requires nothing when external standby names are configured", func() {
+		cluster := newCluster(3, &apiv1.SynchronousReplicaConfiguration{
+			Method:          apiv1.SynchronousReplicaConfigurationMethodAny,
+			Number:          1,
+			StandbyNamesPre: []string{"external"},
+		}, 0)
+		Expect(requiredHealthyStandbysAfterSwitchover(cluster)).To(Equal(0))
+	})
+
+	It("uses minSyncReplicas with the legacy configuration", func() {
+		Expect(requiredHealthyStandbysAfterSwitchover(newCluster(4, nil, 2))).To(Equal(2))
+	})
+
+	It("never requires more standbys than a switchover can leave available", func() {
+		// with 3 instances, only one standby other than the new primary
+		// and the demoted one can be available
+		Expect(requiredHealthyStandbysAfterSwitchover(newCluster(3, nil, 2))).To(Equal(1))
+		// with 2 instances, no standby other than the demoted primary exists
+		cluster := newCluster(2, &apiv1.SynchronousReplicaConfiguration{
+			Method: apiv1.SynchronousReplicaConfigurationMethodAny,
+			Number: 1,
+		}, 0)
+		Expect(requiredHealthyStandbysAfterSwitchover(cluster)).To(Equal(0))
+	})
+})
+
+var _ = Describe("countHealthyStandbysAfterSwitchover", func() {
+	readyPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			},
+		}
+	}
+	draining := func(node string) bool { return node == "draining" }
+
+	It("counts only ready and streaming standbys on schedulable nodes, excluding the target", func() {
+		notReady := readyPod("not-ready")
+		notReady.Status.Conditions = nil
+		standbys := postgres.PostgresqlStatusList{Items: []postgres.PostgresqlStatus{
+			{Pod: readyPod("target"), Node: "ok", IsWalReceiverActive: true},
+			{Pod: readyPod("healthy"), Node: "ok", IsWalReceiverActive: true},
+			{Pod: readyPod("on-draining-node"), Node: "draining", IsWalReceiverActive: true},
+			{Pod: readyPod("not-streaming"), Node: "ok", IsWalReceiverActive: false},
+			{Pod: notReady, Node: "ok", IsWalReceiverActive: true},
+		}}
+		Expect(countHealthyStandbysAfterSwitchover(standbys, "target", draining)).To(Equal(1))
+	})
+})
+
+var _ = Describe("setPrimaryOnSchedulableNode and synchronous replication", func() {
+	var env *testingEnvironment
+
+	BeforeEach(func() {
+		env = buildTestEnvironment()
+	})
+
+	createNode := func(ctx context.Context, name string, unschedulable bool) {
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       corev1.NodeSpec{Unschedulable: unschedulable},
+		}
+		Expect(env.client.Create(ctx, node)).To(Succeed())
+	}
+
+	instanceStatus := func(name, node string, isPrimary, ready bool) postgres.PostgresqlStatus {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}}
+		if ready {
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		}
+		return postgres.PostgresqlStatus{
+			Pod:                 pod,
+			Node:                node,
+			IsPrimary:           isPrimary,
+			IsPodReady:          ready,
+			IsWalReceiverActive: !isPrimary && ready,
+		}
+	}
+
+	setup := func(ctx context.Context, mutators ...func(*apiv1.Cluster)) *apiv1.Cluster {
+		namespace := newFakeNamespace(env.client)
+		mutators = append([]func(*apiv1.Cluster){func(cluster *apiv1.Cluster) {
+			cluster.Spec.PostgresConfiguration.Synchronous = &apiv1.SynchronousReplicaConfiguration{
+				Method:         apiv1.SynchronousReplicaConfigurationMethodAny,
+				Number:         1,
+				DataDurability: apiv1.DataDurabilityLevelRequired,
+			}
+			cluster.Status.ReadyInstances = 3
+			cluster.Status.CurrentPrimary = "pod-1"
+			cluster.Status.TargetPrimary = "pod-1"
+		}}, mutators...)
+		return newFakeCNPGCluster(env.client, namespace, mutators...)
+	}
+
+	It("waits when the remaining standbys are all on draining nodes", func(ctx SpecContext) {
+		// This is the parallel MachineDeployment rollout scenario: pod-3 has
+		// been moved to a fresh node, but pod-2 is still on a node being drained
+		suffix := rand.String(6)
+		createNode(ctx, "node-1-"+suffix, true)
+		createNode(ctx, "node-2-"+suffix, true)
+		createNode(ctx, "node-3-"+suffix, false)
+		cluster := setup(ctx)
+
+		status := postgres.PostgresqlStatusList{Items: []postgres.PostgresqlStatus{
+			instanceStatus("pod-1", "node-1-"+suffix, true, true),
+			instanceStatus("pod-3", "node-3-"+suffix, false, true),
+			instanceStatus("pod-2", "node-2-"+suffix, false, true),
+		}}
+
+		newPrimary, err := env.clusterReconciler.setPrimaryOnSchedulableNode(ctx, cluster, status, &status.Items[0])
+		Expect(err).ToNot(HaveOccurred())
+		Expect(newPrimary).To(BeEmpty())
+	})
+
+	It("waits when a standby is failed even if the bypass for failed pods applies", func(ctx SpecContext) {
+		suffix := rand.String(6)
+		createNode(ctx, "node-1-"+suffix, true)
+		createNode(ctx, "node-2-"+suffix, false)
+		cluster := setup(ctx, func(cluster *apiv1.Cluster) {
+			cluster.Status.ReadyInstances = 2
+			cluster.Status.InstancesStatus = map[apiv1.PodStatus][]string{
+				apiv1.PodHealthy: {"pod-1", "pod-2"},
+				apiv1.PodFailed:  {"pod-3"},
+			}
+		})
+
+		status := postgres.PostgresqlStatusList{Items: []postgres.PostgresqlStatus{
+			instanceStatus("pod-1", "node-1-"+suffix, true, true),
+			instanceStatus("pod-2", "node-2-"+suffix, false, true),
+		}}
+
+		newPrimary, err := env.clusterReconciler.setPrimaryOnSchedulableNode(ctx, cluster, status, &status.Items[0])
+		Expect(err).ToNot(HaveOccurred())
+		Expect(newPrimary).To(BeEmpty())
+	})
+
+	It("switches over when enough standbys remain on schedulable nodes", func(ctx SpecContext) {
+		suffix := rand.String(6)
+		createNode(ctx, "node-1-"+suffix, true)
+		createNode(ctx, "node-2-"+suffix, false)
+		createNode(ctx, "node-3-"+suffix, false)
+		cluster := setup(ctx)
+
+		status := postgres.PostgresqlStatusList{Items: []postgres.PostgresqlStatus{
+			instanceStatus("pod-1", "node-1-"+suffix, true, true),
+			instanceStatus("pod-3", "node-3-"+suffix, false, true),
+			instanceStatus("pod-2", "node-2-"+suffix, false, true),
+		}}
+
+		newPrimary, err := env.clusterReconciler.setPrimaryOnSchedulableNode(ctx, cluster, status, &status.Items[0])
+		Expect(err).ToNot(HaveOccurred())
+		Expect(newPrimary).To(Equal("pod-3"))
+	})
+
+	It("keeps the previous behavior with dataDurability preferred", func(ctx SpecContext) {
+		suffix := rand.String(6)
+		createNode(ctx, "node-1-"+suffix, true)
+		createNode(ctx, "node-2-"+suffix, true)
+		createNode(ctx, "node-3-"+suffix, false)
+		cluster := setup(ctx, func(cluster *apiv1.Cluster) {
+			cluster.Spec.PostgresConfiguration.Synchronous.DataDurability = apiv1.DataDurabilityLevelPreferred
+		})
+
+		status := postgres.PostgresqlStatusList{Items: []postgres.PostgresqlStatus{
+			instanceStatus("pod-1", "node-1-"+suffix, true, true),
+			instanceStatus("pod-3", "node-3-"+suffix, false, true),
+			instanceStatus("pod-2", "node-2-"+suffix, false, true),
+		}}
+
+		newPrimary, err := env.clusterReconciler.setPrimaryOnSchedulableNode(ctx, cluster, status, &status.Items[0])
+		Expect(err).ToNot(HaveOccurred())
+		Expect(newPrimary).To(Equal("pod-3"))
 	})
 })

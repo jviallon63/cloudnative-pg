@@ -66,6 +66,16 @@ will prevent draining the node where the instance is housed.
 Additionally, in clusters with 3 or more instances, CloudNativePG guarantees that
 only one replica at a time is gracefully shut down during a drain operation.
 
+When synchronous replication is configured with `dataDurability: required`
+(or with the legacy `minSyncReplicas` option), the switchover ahead of a drain
+is delayed until the new primary would keep enough ready and streaming
+standbys on schedulable nodes to satisfy the required number of synchronous
+standbys. This prevents write operations from being blocked when several
+nodes are drained in parallel, such as during a rollout of multiple node
+pools, at the cost of keeping the drain of the primary's node blocked by its
+pod disruption budget until enough replicas have been moved to schedulable
+nodes.
+
 Each PostgreSQL `Cluster` is equipped with two associated `PodDisruptionBudget`
 resources - you can easily confirm it with the `kubectl get pdb` command.
 

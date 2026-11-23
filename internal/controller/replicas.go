@@ -317,10 +317,27 @@ func (r *ClusterReconciler) setPrimaryOnSchedulableNode(
 	// and the operator would be waiting for it to be rescheduled to a different node indefinitely if the PVC used can not
 	// be moved between nodes, e.g. local-path-provisioner on Kind.
 
+	drainingNodes := make(map[string]bool)
+	isNodeDraining := func(nodeName string) bool {
+		if draining, ok := drainingNodes[nodeName]; ok {
+			return draining
+		}
+		draining, err := r.isNodeUnschedulableOrBeingDrained(ctx, nodeName)
+		if err != nil {
+			contextLogger.Warning("Cannot check whether node is being drained, considering it unschedulable",
+				"node", nodeName, "error", err.Error())
+			draining = true
+		}
+		drainingNodes[nodeName] = draining
+		return draining
+	}
+
+	requiredStandbys := requiredHealthyStandbysAfterSwitchover(cluster)
+
 	// Start looking for the next primary among the pods
 	for _, candidate := range podsOnOtherNodes.Items {
 		// If candidate on an unschedulable node too, skip it
-		if status, _ := r.isNodeUnschedulableOrBeingDrained(ctx, candidate.Node); status {
+		if isNodeDraining(candidate.Node) {
 			continue
 		}
 
@@ -330,6 +347,23 @@ func (r *ClusterReconciler) setPrimaryOnSchedulableNode(
 
 		// If the candidate has not established a connection to the current primary, skip it
 		if !candidate.IsWalReceiverActive {
+			continue
+		}
+
+		// With required data durability, promoting the candidate is only safe if
+		// the new primary keeps enough standbys that are not going to be evicted
+		// by the ongoing drain. Otherwise, writes would hang until those standbys
+		// are rescheduled. Waiting keeps the current primary in place, and its
+		// PodDisruptionBudget blocks the drain of its node until it is safe.
+		if healthyStandbys := countHealthyStandbysAfterSwitchover(
+			podsOnOtherNodes, candidate.Pod.Name, isNodeDraining,
+		); healthyStandbys < requiredStandbys {
+			contextLogger.Info("Current primary is running on unschedulable node, "+
+				"but switching over would leave too few healthy synchronous standby candidates, waiting",
+				"currentPrimary", primaryPod.Pod.Name,
+				"candidate", candidate.Pod.Name,
+				"healthyStandbysAfterSwitchover", healthyStandbys,
+				"requiredStandbys", requiredStandbys)
 			continue
 		}
 
@@ -358,6 +392,49 @@ func (r *ClusterReconciler) setPrimaryOnSchedulableNode(
 		"instances", status.Items)
 	status.LogStatus(ctx)
 	return "", nil
+}
+
+// requiredHealthyStandbysAfterSwitchover returns how many standbys, other than
+// the new primary and the demoted one, need to be healthy and on schedulable
+// nodes for a drain-triggered switchover not to stall writes because of
+// synchronous replication with required data durability.
+func requiredHealthyStandbysAfterSwitchover(cluster *apiv1.Cluster) int {
+	var required int
+	if syncConfig := cluster.Spec.PostgresConfiguration.Synchronous; syncConfig != nil {
+		// External standbys may satisfy the requirement, and we can't check them
+		if syncConfig.DataDurability == apiv1.DataDurabilityLevelPreferred ||
+			len(syncConfig.StandbyNamesPre) > 0 || len(syncConfig.StandbyNamesPost) > 0 {
+			return 0
+		}
+		required = syncConfig.Number
+	} else {
+		required = cluster.Spec.MinSyncReplicas
+	}
+
+	// The new primary and the demoted one can't count as healthy standbys,
+	// requiring more would block every drain-triggered switchover
+	return max(0, min(required, cluster.Spec.Instances-2))
+}
+
+// countHealthyStandbysAfterSwitchover counts the instances, excluding the
+// switchover target, that are ready, streaming from the primary and not
+// running on a node being drained
+func countHealthyStandbysAfterSwitchover(
+	podsOnOtherNodes postgres.PostgresqlStatusList,
+	targetPrimary string,
+	isNodeDraining func(nodeName string) bool,
+) int {
+	count := 0
+	for _, item := range podsOnOtherNodes.Items {
+		if item.Pod == nil || item.Pod.Name == targetPrimary {
+			continue
+		}
+		if !utils.IsPodReady(*item.Pod) || !item.IsWalReceiverActive || isNodeDraining(item.Node) {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 // reconcileTargetPrimaryForReplicaCluster sets the name of the target designated
