@@ -25,6 +25,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -120,6 +121,24 @@ var _ = Describe("cluster_status unit tests", func() {
 			Expect(remoteCluster.Status.TargetPrimaryTimestamp).ToNot(BeEmpty())
 			Expect(remoteCluster.Status.TargetPrimary).To(Equal(podName))
 		})
+	})
+
+	It("blocks non-primary disruptions before requesting a switchover", func(ctx SpecContext) {
+		namespace := newFakeNamespace(env.client)
+		cluster := newFakeCNPGCluster(env.client, namespace, func(cluster *apiv1.Cluster) {
+			cluster.Status.CurrentPrimary = cluster.Name + "-1"
+			cluster.Status.TargetPrimary = cluster.Name + "-1"
+		})
+
+		err := env.clusterReconciler.setPrimaryInstance(ctx, cluster, cluster.Name+"-2")
+		Expect(err).ToNot(HaveOccurred())
+
+		var pdb policyv1.PodDisruptionBudget
+		err = env.client.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: namespace}, &pdb)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(pdb.Spec.MinAvailable.String()).To(Equal("100%"))
+		Expect(pdb.Spec.Selector.MatchExpressions).To(HaveLen(1))
+		Expect(pdb.Spec.Selector.MatchExpressions[0].Values).To(ContainElement(specs.ClusterRoleLabelUnhealthy))
 	})
 
 	It("makes sure RegisterPhase works correctly", func() {

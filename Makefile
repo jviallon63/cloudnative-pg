@@ -18,7 +18,7 @@
 #
 
 # Image URL to use all building/pushing image targets
-IMAGE_NAME ?= ghcr.io/cloudnative-pg/cloudnative-pg-testing
+IMAGE_NAME ?= k8s-docker-snapshot.artifactory.michelin.com/k8s/cloudnative-pg/cnpg-operator
 
 # Prevent e2e tests to proceed with empty tag which
 # will be considered as "latest".

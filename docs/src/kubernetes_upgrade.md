@@ -76,6 +76,13 @@ pools, at the cost of keeping the drain of the primary's node blocked by its
 pod disruption budget until enough replicas have been moved to schedulable
 nodes.
 
+While a switchover or a failover is in progress, the replica
+`PodDisruptionBudget` temporarily covers every non-primary instance,
+including the demoted primary, and allows no voluntary disruption. This
+prevents parallel drains from evicting the remaining instances while role
+labels are in transition. The budget is restored as soon as the new primary
+is in place.
+
 Each PostgreSQL `Cluster` is equipped with two associated `PodDisruptionBudget`
 resources - you can easily confirm it with the `kubectl get pdb` command.
 

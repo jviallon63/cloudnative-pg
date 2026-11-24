@@ -767,6 +767,18 @@ func (r *ClusterReconciler) setPrimaryInstance(
 	cluster *apiv1.Cluster,
 	podName string,
 ) error {
+	if cluster.Status.CurrentPrimary != "" && podName != cluster.Status.CurrentPrimary {
+		// Protect the instances whose role labels are about to change before
+		// the switchover/failover starts. A failure here must not prevent a
+		// failover: the PDB will be reconciled again in the next loop.
+		transitioningCluster := cluster.DeepCopy()
+		transitioningCluster.Status.TargetPrimary = podName
+		if err := r.reconcilePodDisruptionBudget(ctx, transitioningCluster); err != nil {
+			log.FromContext(ctx).Error(err, "while protecting instances before changing the target primary",
+				"targetPrimary", podName)
+		}
+	}
+
 	origCluster := cluster.DeepCopy()
 	cluster.Status.TargetPrimary = podName
 	cluster.Status.TargetPrimaryTimestamp = pgTime.GetCurrentTimestamp()

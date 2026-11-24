@@ -31,7 +31,11 @@ import (
 )
 
 // BuildReplicasPodDisruptionBudget creates a pod disruption budget telling
-// K8s to avoid removing more than one replica at a time
+// K8s to avoid removing more than one replica at a time.
+// While a switchover or failover is in progress, instance role labels are
+// in transition (the promoted instance may still be labelled as a replica
+// and the demoted primary is labelled as unhealthy): in that window the
+// PDB covers every non-primary instance and allows no voluntary disruption.
 func BuildReplicasPodDisruptionBudget(cluster *apiv1.Cluster) *policyv1.PodDisruptionBudget {
 	// We should ensure that in a cluster of n instances,
 	// with n-1 replicas, at least n-2 are always available
@@ -63,6 +67,23 @@ func BuildReplicasPodDisruptionBudget(cluster *apiv1.Cluster) *policyv1.PodDisru
 			},
 			MinAvailable: &allReplicasButOne,
 		},
+	}
+
+	if isPrimaryTransitionInProgress(cluster) {
+		allInstances := intstr.FromString("100%")
+		pdb.Spec.Selector = &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				utils.ClusterLabelName: cluster.Name,
+			},
+			MatchExpressions: []metav1.LabelSelectorRequirement{
+				{
+					Key:      utils.ClusterInstanceRoleLabelName,
+					Operator: metav1.LabelSelectorOpIn,
+					Values:   []string{ClusterRoleLabelReplica, ClusterRoleLabelUnhealthy},
+				},
+			},
+		}
+		pdb.Spec.MinAvailable = &allInstances
 	}
 
 	cluster.SetInheritedDataAndOwnership(&pdb.ObjectMeta)
@@ -106,4 +127,11 @@ func BuildPrimaryPodDisruptionBudget(cluster *apiv1.Cluster) *policyv1.PodDisrup
 	cluster.SetInheritedDataAndOwnership(&pdb.ObjectMeta)
 
 	return pdb
+}
+
+// isPrimaryTransitionInProgress returns true when a switchover or a failover
+// has been requested and not yet completed
+func isPrimaryTransitionInProgress(cluster *apiv1.Cluster) bool {
+	return cluster.Status.CurrentPrimary != "" &&
+		cluster.Status.TargetPrimary != cluster.Status.CurrentPrimary
 }

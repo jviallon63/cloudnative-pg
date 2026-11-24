@@ -68,4 +68,41 @@ var _ = Describe("POD Disruption Budget specifications", func() {
 		result := BuildPrimaryPodDisruptionBudget(cluster)
 		Expect(result.Spec.MinAvailable.IntVal).To(Equal(int32(minAvailablePrimary)))
 	})
+
+	It("selects only replicas when no switchover or failover is in progress", func() {
+		stable := cluster.DeepCopy()
+		stable.Status.CurrentPrimary = "thistest-1"
+		stable.Status.TargetPrimary = "thistest-1"
+
+		result := BuildReplicasPodDisruptionBudget(stable)
+		Expect(result.Spec.Selector.MatchLabels).To(HaveKeyWithValue(
+			utils.ClusterInstanceRoleLabelName, ClusterRoleLabelReplica))
+		Expect(result.Spec.Selector.MatchExpressions).To(BeEmpty())
+		Expect(result.Spec.MinAvailable.IntVal).To(Equal(int32(minAvailableReplicas)))
+	})
+
+	It("blocks every non-primary disruption while a switchover or failover is in progress", func() {
+		switchingOver := cluster.DeepCopy()
+		switchingOver.Status.CurrentPrimary = "thistest-1"
+		switchingOver.Status.TargetPrimary = "thistest-2"
+
+		result := BuildReplicasPodDisruptionBudget(switchingOver)
+		Expect(result.Spec.Selector.MatchLabels).To(Equal(map[string]string{
+			utils.ClusterLabelName: cluster.Name,
+		}))
+		Expect(result.Spec.Selector.MatchExpressions).To(ConsistOf(metav1.LabelSelectorRequirement{
+			Key:      utils.ClusterInstanceRoleLabelName,
+			Operator: metav1.LabelSelectorOpIn,
+			Values:   []string{ClusterRoleLabelReplica, ClusterRoleLabelUnhealthy},
+		}))
+		Expect(result.Spec.MinAvailable.String()).To(Equal("100%"))
+	})
+
+	It("does not consider the bootstrap of a new cluster as a switchover", func() {
+		bootstrapping := cluster.DeepCopy()
+		bootstrapping.Status.TargetPrimary = "thistest-1"
+
+		result := BuildReplicasPodDisruptionBudget(bootstrapping)
+		Expect(result.Spec.MinAvailable.IntVal).To(Equal(int32(minAvailableReplicas)))
+	})
 })
